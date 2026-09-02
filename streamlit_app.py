@@ -37,25 +37,45 @@ if prompt := st.chat_input("Ask a question about your data..."):
         st.markdown(prompt)
 
     # 5. Call the Snowflake Cortex API
-    with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
-            payload = {
-                "messages": st.session_state.messages,
-                "stream": False # Set to false for a single JSON response
-            }
-            
-            try:
-                response = requests.post(URL, headers=HEADERS, json=payload)
-                response.raise_for_status()
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
                 
-                # Extract the newest assistant reply from the messages array
-                data = response.json()
-                assistant_reply = data["messages"][-1]["content"]
+                # --- FIX 1: Format messages exactly how Cortex Agents expects them ---
+                api_messages = []
+                for msg in st.session_state.messages:
+                    api_messages.append({
+                        "role": msg["role"],
+                        "content": [
+                            {
+                                "type": "text", 
+                                "text": msg["content"]
+                            }
+                        ]
+                    })
+                    
+                payload = {
+                    "messages": api_messages,
+                    "stream": False
+                }
                 
-                st.markdown(assistant_reply)
-                st.session_state.messages.append({"role": "assistant", "content": assistant_reply})
-                
-            except requests.exceptions.RequestException as e:
-                st.error(f"API Error: {e}")
-                if response.content:
-                    st.error(response.json())
+                try:
+                    response = requests.post(URL, headers=HEADERS, json=payload)
+                    response.raise_for_status()
+                    
+                    data = response.json()
+                    
+                    # --- FIX 2: Parse the Cortex Agent's response structure ---
+                    # The API returns: {"role": "assistant", "content": [{"type": "text", "text": "..."}]}
+                    assistant_reply = ""
+                    for block in data.get("content", []):
+                        if block.get("type") == "text":
+                            assistant_reply += block.get("text", "") + "\n"
+                            
+                    # Display and save the extracted text
+                    st.markdown(assistant_reply)
+                    st.session_state.messages.append({"role": "assistant", "content": assistant_reply.strip()})
+                    
+                except requests.exceptions.RequestException as e:
+                    st.error(f"API Error: {e}")
+                    if response.content:
+                        st.error(response.json())
