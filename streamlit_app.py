@@ -243,7 +243,7 @@ if prompt := st.chat_input("Ask a question about your data..."):
 
             try:
                 response = requests.post(
-                    URL, headers=HEADERS, json=payload, timeout=60
+                    URL, headers=HEADERS, json=payload, timeout=(10, 600)
                 )
                 response.raise_for_status()
                 data = response.json()
