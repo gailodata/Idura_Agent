@@ -1,4 +1,5 @@
 import base64
+import html
 import json
 from datetime import datetime
 from pathlib import Path
@@ -47,6 +48,26 @@ st.markdown(
     }
     [data-testid="stChatMessage"] [data-testid="stFullScreenFrame"] {
         margin-top: 1.5rem;
+    }
+    .ailo-status {
+        display: flex;
+        align-items: center;
+        gap: 0.6rem;
+        font-size: 14px;
+        font-weight: 300;
+        color: #907374;
+        padding: 0.25rem 0;
+    }
+    .ailo-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #491C1F;
+        animation: ailo-pulse 1.2s ease-in-out infinite;
+    }
+    @keyframes ailo-pulse {
+        0%, 100% { opacity: 0.25; transform: scale(0.85); }
+        50% { opacity: 1; transform: scale(1); }
     }
     .ailo-corner-logo {
         position: fixed;
@@ -188,8 +209,68 @@ URL = f"https://{HOST}/api/v2/databases/{DB}/schemas/{SCHEMA}/agents/{AGENT}:run
 HEADERS = {
     "Authorization": f"Bearer {PAT}",
     "Content-Type": "application/json",
-    "Accept": "application/json",
+    "Accept": "text/event-stream",
 }
+
+
+def iter_sse(response):
+    """Yield (event, data) pairs from a server-sent events stream."""
+    event, data_lines = None, []
+    for line in response.iter_lines(decode_unicode=True):
+        if line is None:
+            continue
+        if line == "":
+            if data_lines:
+                raw = "\n".join(data_lines)
+                try:
+                    yield event, json.loads(raw)
+                except json.JSONDecodeError:
+                    yield event, raw
+            event, data_lines = None, []
+        elif line.startswith("event:"):
+            event = line[len("event:"):].strip()
+        elif line.startswith("data:"):
+            data_lines.append(line[len("data:"):].lstrip())
+    if data_lines:
+        try:
+            yield event, json.loads("\n".join(data_lines))
+        except json.JSONDecodeError:
+            pass
+
+
+def parse_chart_spec(raw_spec):
+    if not raw_spec:
+        return None
+    return json.loads(raw_spec) if isinstance(raw_spec, str) else raw_spec
+
+
+def blocks_from_final(content):
+    """Turn the content of the final `response` event into our stored blocks."""
+    blocks = []
+    for block in content or []:
+        block_type = block.get("type")
+        if block_type == "text" and block.get("text"):
+            blocks.append({"type": "text", "data": block["text"]})
+        elif block_type == "chart":
+            spec = parse_chart_spec(block.get("chart", {}).get("chart_spec"))
+            if spec:
+                blocks.append({"type": "chart", "data": spec})
+    return blocks
+
+
+def render_blocks(blocks):
+    for item in blocks:
+        if item.get("type") == "text":
+            st.markdown(item.get("data", ""))
+        elif item.get("type") == "chart":
+            render_chart(item.get("data"))
+
+
+def show_status(placeholder, message):
+    placeholder.markdown(
+        f'<div class="ailo-status"><span class="ailo-dot"></span>{html.escape(message)}</div>',
+        unsafe_allow_html=True,
+    )
 
 # 3. Initialize chat history in session state
 if "messages" not in st.session_state:
@@ -199,11 +280,7 @@ if "messages" not in st.session_state:
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"], avatar=AVATARS[msg["role"]]):
         if isinstance(msg["content"], list):
-            for item in msg["content"]:
-                if item.get("type") == "text":
-                    st.markdown(item.get("data", ""))
-                elif item.get("type") == "chart":
-                    render_chart(item.get("data"))
+            render_blocks(msg["content"])
         else:
             st.markdown(msg["content"])
 
@@ -214,73 +291,92 @@ if prompt := st.chat_input("Ask a question about your data..."):
     with st.chat_message("user", avatar=AVATARS["user"]):
         st.markdown(prompt)
 
-    # 5. Call the Snowflake Cortex API
+    # 5. Call the Snowflake Cortex API (streamed, so long analyses show progress)
     with st.chat_message("assistant", avatar=AVATARS["assistant"]):
-        with st.spinner("Thinking..."):
-            # Format messages for Cortex Agent schema
-            api_messages = []
-            for msg in st.session_state.messages:
-                content_text = ""
-                if isinstance(msg["content"], str):
-                    content_text = msg["content"]
-                elif isinstance(msg["content"], list):
-                    # Combine text fragments for message history context
-                    content_text = " ".join(
-                        item.get("data", "")
-                        for item in msg["content"]
-                        if item.get("type") == "text"
-                    )
+        status_ph = st.empty()
+        body_ph = st.empty()
+        show_status(status_ph, "Thinking")
 
-                api_messages.append({
-                    "role": msg["role"],
-                    "content": [{"type": "text", "text": content_text}],
-                })
-
-            payload = {
-                "messages": api_messages,
-                "stream": False,
-            }
-
-            try:
-                response = requests.post(
-                    URL, headers=HEADERS, json=payload, timeout=(10, 600)
+        # Format messages for Cortex Agent schema
+        api_messages = []
+        for msg in st.session_state.messages:
+            content_text = ""
+            if isinstance(msg["content"], str):
+                content_text = msg["content"]
+            elif isinstance(msg["content"], list):
+                # Combine text fragments for message history context
+                content_text = " ".join(
+                    item.get("data", "")
+                    for item in msg["content"]
+                    if item.get("type") == "text"
                 )
+
+            api_messages.append({
+                "role": msg["role"],
+                "content": [{"type": "text", "text": content_text}],
+            })
+
+        payload = {
+            "messages": api_messages,
+            "stream": True,
+        }
+
+        texts = {}       # content_index -> streamed text
+        charts = []      # charts seen during the stream (fallback)
+        final_blocks = None
+        error_msg = None
+
+        try:
+            with requests.post(
+                URL, headers=HEADERS, json=payload, stream=True, timeout=(10, 900)
+            ) as response:
                 response.raise_for_status()
-                data = response.json()
+                response.encoding = "utf-8"
 
-                assistant_blocks = []
+                for event, data in iter_sse(response):
+                    if not isinstance(data, dict):
+                        continue
 
-                # Parse both text and chart response blocks
-                for block in data.get("content", []):
-                    block_type = block.get("type")
+                    if event == "response.status":
+                        show_status(status_ph, data.get("message") or "Working")
+                    elif event == "response.tool_result.status":
+                        show_status(status_ph, data.get("status") or data.get("message") or "Running query")
+                    elif event == "response.thinking.delta":
+                        show_status(status_ph, "Thinking")
+                    elif event == "response.text.delta":
+                        idx = data.get("content_index", 0)
+                        texts[idx] = texts.get(idx, "") + data.get("text", "")
+                        body_ph.markdown("\n\n".join(texts[i] for i in sorted(texts)))
+                    elif event == "response.chart":
+                        spec = parse_chart_spec(data.get("chart_spec"))
+                        if spec:
+                            charts.append(spec)
+                    elif event == "error":
+                        error_msg = data.get("message") or "The agent returned an error."
+                        break
+                    elif event == "response":
+                        final_blocks = blocks_from_final(data.get("content"))
 
-                    if block_type == "text":
-                        text_val = block.get("text", "")
-                        st.markdown(text_val)
-                        assistant_blocks.append({"type": "text", "data": text_val})
+        except requests.exceptions.RequestException as e:
+            error_msg = f"API Error: {e}"
+            if getattr(e, "response", None) is not None:
+                error_msg += f"\n\n{e.response.text}"
 
-                    elif block_type == "chart":
-                        chart_data = block.get("chart", {})
-                        raw_spec = chart_data.get("chart_spec")
+        status_ph.empty()
 
-                        if raw_spec:
-                            parsed_spec = (
-                                json.loads(raw_spec)
-                                if isinstance(raw_spec, str)
-                                else raw_spec
-                            )
-                            render_chart(parsed_spec)
-                            assistant_blocks.append({
-                                "type": "chart",
-                                "data": parsed_spec,
-                            })
+        if final_blocks is None:
+            # Stream ended without a final event: keep what we received
+            final_blocks = [
+                {"type": "text", "data": texts[i]} for i in sorted(texts) if texts[i]
+            ] + [{"type": "chart", "data": c} for c in charts]
 
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": assistant_blocks,
-                })
+        with body_ph.container():
+            render_blocks(final_blocks)
+            if error_msg:
+                st.error(error_msg)
 
-            except requests.exceptions.RequestException as e:
-                st.error(f"API Error: {e}")
-                if hasattr(e, "response") and e.response is not None:
-                    st.error(e.response.text)
+        if final_blocks:
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": final_blocks,
+            })
