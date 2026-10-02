@@ -72,7 +72,7 @@ st.markdown(
     .ailo-corner-logo {
         position: fixed;
         right: 2rem;
-        bottom: 1.75rem;
+        bottom: 73px;  /* vertically centred on the chat input */
         height: 24px;
         z-index: 1000;
         pointer-events: none;
@@ -101,6 +101,30 @@ st.markdown(
         color: #322D29;
         margin-top: 0.4rem;
         margin-bottom: 2rem;
+    }
+    /* Soft intro: kicker fades in, greeting appears letter by letter, subtitle word by word */
+    .ailo-kicker { animation: ailo-fade 1.4s ease-out both; }
+    .ailo-word { display: inline-block; white-space: nowrap; }
+    .ailo-char,
+    .ailo-sub-word {
+        display: inline-block;
+        opacity: 0;
+        animation: ailo-rise 1.6s cubic-bezier(0.25, 0.1, 0.25, 1) forwards;
+    }
+    @keyframes ailo-fade {
+        from { opacity: 0; }
+        to { opacity: 1; }
+    }
+    @keyframes ailo-rise {
+        from { opacity: 0; transform: translateY(0.15em); }
+        to { opacity: 1; transform: none; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+        .ailo-kicker, .ailo-char, .ailo-sub-word {
+            animation: none !important;
+            opacity: 1 !important;
+            transform: none !important;
+        }
     }
     [data-testid="stChatInput"] > div {
         background-color: #491C1F !important;
@@ -137,6 +161,31 @@ st.markdown(
 LOGO_B64 = base64.b64encode((ASSETS / "ailo_logo.png").read_bytes()).decode()
 
 
+def animated_letters(text, start=0.4, step=0.08):
+    """Wrap each letter in a span with a staggered animation delay (words kept unbroken)."""
+    parts, i = [], 0
+    for word in text.split(" "):
+        letters = []
+        for ch in word:
+            letters.append(
+                f'<span class="ailo-char" style="animation-delay:{start + i * step:.3f}s">'
+                f"{html.escape(ch)}</span>"
+            )
+            i += 1
+        parts.append(f'<span class="ailo-word">{"".join(letters)}</span>')
+        i += 2  # small pause between words
+    return " ".join(parts), start + i * step
+
+
+def animated_words(text, start, step=0.16):
+    """Wrap each word in a span with a staggered animation delay."""
+    return " ".join(
+        f'<span class="ailo-sub-word" style="animation-delay:{start + n * step:.3f}s">'
+        f"{html.escape(word)}</span>"
+        for n, word in enumerate(text.split(" "))
+    )
+
+
 def greeting():
     """Time-of-day greeting in the viewer's own timezone (the server runs in UTC)."""
     try:
@@ -151,25 +200,36 @@ def greeting():
     return "Good evening"
 
 
+title_html, title_end = animated_letters(f"{greeting()},")
+subtitle_html = animated_words("What insights can I help with?", start=title_end + 0.2)
+
 st.markdown(
     f"""
     <img class="ailo-corner-logo" src="data:image/png;base64,{LOGO_B64}" alt="AILO">
     <div class="ailo-kicker">IDURA — CONTENT-TO-LEAD AGENT</div>
-    <div class="ailo-title">{greeting()},</div>
-    <div class="ailo-subtitle">What insights can I help with?</div>
+    <div class="ailo-title" aria-label="{greeting()},">{title_html}</div>
+    <div class="ailo-subtitle">{subtitle_html}</div>
     """,
     unsafe_allow_html=True,
 )
 
 
+# Bordeaux plus equal 12% steps towards white, used when a chart needs several colours
+AILO_BORDEAUX_SCALE = ["#491C1F", "#5F373A", "#755255", "#8B6E70", "#A0898B", "#B6A4A5", "#CCBFC0"]
+
 AILO_CHART_CONFIG = {
     "font": "Helvetica Neue",
     "background": "transparent",
-    "mark": {"color": "#CFCBC3"},
-    "bar": {"color": "#CFCBC3"},
+    "mark": {"color": "#491C1F"},
+    "bar": {"color": "#491C1F"},
     "line": {"color": "#491C1F", "strokeWidth": 2},
     "point": {"color": "#491C1F"},
-    "range": {"category": ["#491C1F", "#907374", "#CFCBC3", "#322D29", "#E9E5E0"]},
+    "range": {
+        "category": AILO_BORDEAUX_SCALE,
+        "ordinal": AILO_BORDEAUX_SCALE,
+        "ramp": AILO_BORDEAUX_SCALE[::-1],
+        "heatmap": AILO_BORDEAUX_SCALE[::-1],
+    },
     "view": {"stroke": None},
     "padding": 16,
     "scale": {"bandPaddingInner": 0.6, "bandPaddingOuter": 0.3},
@@ -190,9 +250,47 @@ AILO_CHART_CONFIG = {
 }
 
 
+STACKABLE_MARKS = {"bar", "area"}
+
+
+def _mark_type(mark):
+    return mark.get("type") if isinstance(mark, dict) else mark
+
+
+def darkest_at_bottom(view):
+    """In stacked bars/areas, stack segments in colour order so the darkest shade sits at the bottom."""
+    enc = view.get("encoding")
+    if not isinstance(enc, dict) or _mark_type(view.get("mark")) not in STACKABLE_MARKS:
+        return view
+    color = enc.get("color")
+    if not isinstance(color, dict) or "field" not in color or "order" in enc:
+        return view
+    if any(isinstance(enc.get(ch), dict) and enc[ch].get("stack") in (False, None) and "stack" in enc[ch]
+           for ch in ("x", "y")):
+        return view  # stacking explicitly turned off
+
+    view = dict(view)
+    enc = dict(enc)
+    field, sort = color["field"], color.get("sort")
+    if isinstance(sort, list):
+        # Custom category order: stack by each value's position in that list
+        view["transform"] = list(view.get("transform", [])) + [{
+            "calculate": f"indexof({json.dumps(sort)}, datum[{json.dumps(field)}])",
+            "as": "__ailo_stack_order",
+        }]
+        enc["order"] = {"field": "__ailo_stack_order", "type": "quantitative", "sort": "ascending"}
+    else:
+        direction = "descending" if sort == "descending" else "ascending"
+        enc["order"] = {"field": field, "sort": direction}
+    view["encoding"] = enc
+    return view
+
+
 def render_chart(spec):
     """Render a Vega-Lite spec from the agent in AILO colours."""
-    spec = dict(spec)
+    spec = darkest_at_bottom(dict(spec))
+    if isinstance(spec.get("layer"), list):
+        spec["layer"] = [darkest_at_bottom(layer) for layer in spec["layer"]]
     spec["config"] = {**AILO_CHART_CONFIG, **spec.get("config", {})}
     st.vega_lite_chart(spec, use_container_width=True, theme=None)
 
